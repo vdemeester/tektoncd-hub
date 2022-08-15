@@ -131,7 +131,7 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		if ta.proto {
-			name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			initCode += fmt.Sprintf("%s := &%s{}\n", targetVar, name)
 			targetVar += ".Field"
 			newVar = false
@@ -148,12 +148,12 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 	if ta.proto {
 		if isUnionMessage(target) {
 			ta = dupTransformAttrs(ta)
-			ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, false, false)
+			ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), false, false)
 		}
 	} else {
 		if isUnionMessage(source) {
 			ta = dupTransformAttrs(ta)
-			ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg)
+			ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source))
 		}
 	}
 
@@ -168,9 +168,9 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 			code, err = transformObject(source, target, sourceVar, targetVar, newVar, ta)
 		case expr.IsUnion(source.Type):
 			if ta.proto {
-				code, err = transformUnionToProto(source, target, sourceVar, targetVar, newVar, ta)
+				code, err = transformUnionToProto(source, target, sourceVar, targetVar, ta)
 			} else {
-				code, err = transformUnionFromProto(source, target, sourceVar, targetVar, newVar, ta)
+				code, err = transformUnionFromProto(source, target, sourceVar, targetVar, ta)
 			}
 		default:
 			assign := "="
@@ -257,13 +257,14 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 	if newVar {
 		assign = ":="
 	}
-	tname := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+	tname := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 	buffer.WriteString(fmt.Sprintf("%s %s %s%s{%s}\n", targetVar, assign, deref, tname, initCode))
 	buffer.WriteString(postInitCode)
 
 	// iterate through attributes to initialize rest of the struct fields and
 	// handle default values
 	var err error
+	scope := codegen.NewNameScope()
 	walkMatches(source, target, func(srcMatt, tgtMatt *expr.MappedAttributeExpr, srcc, tgtc *expr.AttributeExpr, n string) {
 		srcc = unAlias(srcc)
 		tgtc = unAlias(tgtc)
@@ -276,7 +277,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 		{
 			if err = codegen.IsCompatible(srcc.Type, tgtc.Type, "", ""); err != nil {
 				if ta.proto {
-					ta.targetInit = ta.TargetCtx.Scope.Name(tgtc, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+					ta.targetInit = ta.TargetCtx.Scope.Name(tgtc, ta.TargetCtx.Pkg(tgtc), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 					tgtc = unwrapAttr(tgtc)
 				} else {
 					srcc = unwrapAttr(srcc)
@@ -341,8 +342,9 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 				// buffer sets boolean fields as false.
 				if !srcMatt.IsRequired(n) && srcc.Type != expr.Boolean {
 					if typeName, _ := codegen.GetMetaType(tgtc); typeName != "" {
-						code += fmt.Sprintf("var zero %s\n\t", typeName)
-						code += fmt.Sprintf("if %s == zero {\n\t", srcVar)
+						zero := scope.Unique("zero" + codegen.Goify(srcVar, true))
+						code += fmt.Sprintf("var %s %s\n\t", zero, protoBufNativeGoTypeName(tgtc.Type))
+						code += fmt.Sprintf("if %s == %s {\n\t", srcVar, zero)
 					} else {
 						check := checkZeroValue(srcc.Type, srcVar, false)
 						if check != "" {
@@ -371,7 +373,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 // type to target attribute of array type. It returns an error if source
 // and target are not compatible for transformation.
 func transformArray(source, target *expr.Array, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
-	targetRef := ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg)
+	targetRef := ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg(target.ElemType))
 
 	var (
 		code string
@@ -402,7 +404,7 @@ func transformArray(source, target *expr.Array, sourceVar, targetVar string, new
 	tgt := target.ElemType
 	if err = codegen.IsCompatible(src.Type, tgt.Type, "[0]", "[0]"); err != nil {
 		if ta.proto {
-			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg(tgt), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			tgt = unwrapAttr(expr.DupAtt(tgt))
 		} else {
 			src = unwrapAttr(expr.DupAtt(src))
@@ -447,8 +449,8 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 	if ta.proto {
 		et = unAlias(et)
 	}
-	targetKeyRef := ta.TargetCtx.Scope.Ref(kt, ta.TargetCtx.Pkg)
-	targetElemRef := ta.TargetCtx.Scope.Ref(et, ta.TargetCtx.Pkg)
+	targetKeyRef := ta.TargetCtx.Scope.Ref(kt, ta.TargetCtx.Pkg(kt))
+	targetElemRef := ta.TargetCtx.Scope.Ref(et, ta.TargetCtx.Pkg(et))
 
 	var (
 		code string
@@ -479,7 +481,7 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 	tgt := target.ElemType
 	if err = codegen.IsCompatible(src.Type, tgt.Type, "[*]", "[*]"); err != nil {
 		if ta.proto {
-			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg(tgt), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			tgt = unwrapAttr(expr.DupAtt(tgt))
 		} else {
 			src = unwrapAttr(expr.DupAtt(src))
@@ -515,11 +517,11 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 // transformUnionToProto returns the code to transform an attribute of type
 // union from Goa to protobuf. It returns an error if source and target are not
 // compatible for transformation.
-func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
+func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) (string, error) {
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		return "", err
 	}
-	tdata := transformUnionData(source, target, sourceVar, targetVar, ta)
+	tdata := transformUnionData(source, target, ta)
 	targetValueTypeNames := make([]string, len(tdata.TargetValues))
 	targetFieldNames := make([]string, len(tdata.TargetValues))
 	for i, v := range tdata.TargetValues {
@@ -548,11 +550,11 @@ func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, target
 // transformUnionFromProto returns the code to transform an attribute of type
 // union from Goa to protobuf. It returns an error if source and target are not
 // compatible for transformation.
-func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
+func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) (string, error) {
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		return "", err
 	}
-	tdata := transformUnionData(source, target, sourceVar, targetVar, ta)
+	tdata := transformUnionData(source, target, ta)
 	sourceFieldNames := make([]string, len(tdata.SourceValues))
 	for i, v := range tdata.SourceValues {
 		fieldName := ta.SourceCtx.Scope.Field(v.Attribute, v.Name, true)
@@ -584,9 +586,9 @@ func convertType(src, tgt *expr.AttributeExpr, srcVar string, ta *transformAttrs
 		srcp, tgtp := unAlias(src), unAlias(tgt)
 		if srcp.Type == tgtp.Type {
 			if ta.proto {
-				return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgtp), srcVar)
+				return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgtp.Type), srcVar)
 			}
-			return fmt.Sprintf("%s(%s)", ta.TargetCtx.Scope.Ref(tgt, ta.TargetCtx.Pkg), srcVar)
+			return fmt.Sprintf("%s(%s)", ta.TargetCtx.Scope.Ref(tgt, ta.TargetCtx.Pkg(tgt)), srcVar)
 		}
 		return fmt.Sprintf("%s(%s)", transformHelperName(src, tgt, ta), srcVar)
 	}
@@ -600,7 +602,7 @@ func convertType(src, tgt *expr.AttributeExpr, srcVar string, ta *transformAttrs
 	if src.Type != expr.Int && src.Type != expr.UInt {
 		if srcType != "" || tgtType != "" {
 			if ta.proto || tgtType == "" {
-				tgtType = protoBufNativeGoTypeName(tgt)
+				tgtType = protoBufNativeGoTypeName(tgt.Type)
 			}
 			return fmt.Sprintf("%s(%s)", tgtType, srcVar)
 		}
@@ -608,7 +610,7 @@ func convertType(src, tgt *expr.AttributeExpr, srcVar string, ta *transformAttrs
 	}
 
 	if ta.proto {
-		return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgt), srcVar)
+		return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgt.Type), srcVar)
 	}
 	if tgtType == "" {
 		tgtType = codegen.GoNativeTypeName(tgt.Type)
@@ -642,7 +644,7 @@ func checkZeroValue(dt expr.DataType, target string, negate bool) string {
 }
 
 // transformUnionData returns data needed by both transformUnion functions.
-func transformUnionData(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) *unionData {
+func transformUnionData(source, target *expr.AttributeExpr, ta *transformAttrs) *unionData {
 	src := expr.AsUnion(source.Type)
 	tgt := expr.AsUnion(target.Type)
 	srcValues := make([]*expr.NamedAttributeExpr, len(src.Values))
@@ -653,7 +655,7 @@ func transformUnionData(source, target *expr.AttributeExpr, sourceVar, targetVar
 	sourceValueTypeRefs := make([]string, len(src.Values))
 	for i, v := range src.Values {
 		if ta.proto {
-			sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg)
+			sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg(v.Attribute))
 		} else {
 			fieldName := ta.SourceCtx.Scope.Field(v.Attribute, v.Name, true)
 			sourceValueTypeRefs[i] = ta.message + "_" + fieldName
@@ -724,7 +726,7 @@ func transformAttributeHelpers(source, target *expr.AttributeExpr, ta *transform
 				}
 			}
 		case expr.IsObject(source.Type):
-			walkMatches(source, target, func(srcMatt, tgtMatt *expr.MappedAttributeExpr, srcc, tgtc *expr.AttributeExpr, n string) {
+			walkMatches(source, target, func(srcMatt, _ *expr.MappedAttributeExpr, srcc, tgtc *expr.AttributeExpr, n string) {
 				if err != nil {
 					return
 				}
@@ -810,12 +812,12 @@ func collectHelpers(source, target *expr.AttributeExpr, req bool, ta *transformA
 			if ta.proto {
 				if isUnionMessage(target) {
 					ta = dupTransformAttrs(ta)
-					ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, false, false)
+					ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), false, false)
 				}
 			} else {
 				if isUnionMessage(source) {
 					ta = dupTransformAttrs(ta)
-					ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg)
+					ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source))
 				}
 			}
 			name := transformHelperName(source, target, ta)
@@ -831,8 +833,8 @@ func collectHelpers(source, target *expr.AttributeExpr, req bool, ta *transformA
 			}
 			tfd := &codegen.TransformFunctionData{
 				Name:          name,
-				ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg),
-				ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
+				ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source)),
+				ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
 				Code:          code,
 			}
 			seen[name] = tfd
@@ -891,8 +893,8 @@ func transformHelperName(source, target *expr.AttributeExpr, ta *transformAttrs)
 		prefix string
 	)
 	{
-		sname = codegen.Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
-		tname = codegen.Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
+		sname = codegen.Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg(source), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
+		tname = codegen.Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
 		prefix = ta.Prefix
 	}
 	return codegen.Goify(prefix+sname+"To"+tname, false)
