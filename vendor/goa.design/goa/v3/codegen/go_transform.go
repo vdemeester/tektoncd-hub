@@ -52,7 +52,6 @@ func init() {
 // newVar if true initializes a target variable with the generated Go code
 // using `:=` operator. If false, it assigns Go code to the target variable
 // using `=`.
-//
 func GoTransform(source, target *expr.AttributeExpr, sourceVar, targetVar string, sourceCtx, targetCtx *AttributeContext, prefix string, newVar bool) (string, []*TransformFunctionData, error) {
 	ta := &TransformAttrs{
 		SourceCtx: sourceCtx,
@@ -85,7 +84,7 @@ func transformPrimitive(source, target *expr.AttributeExpr, sourceVar, targetVar
 		assign = ":="
 	}
 	if source.Type.Name() != target.Type.Name() {
-		cast := ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg)
+		cast := ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target))
 		return fmt.Sprintf("%s %s %s(%s)\n", targetVar, assign, cast, sourceVar), nil
 	}
 	return fmt.Sprintf("%s %s %s\n", targetVar, assign, sourceVar), nil
@@ -153,7 +152,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 					if srcPtr {
 						deref = "*"
 					}
-					exp = fmt.Sprintf("%s(%s%s)", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg), deref, srcField)
+					exp = fmt.Sprintf("%s(%s%s)", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg(tgtc)), deref, srcField)
 					if srcPtr && !srcMatt.IsRequired(n) {
 						postInitCode += fmt.Sprintf("if %s != nil {\n", srcField)
 						if tgtPtr {
@@ -197,7 +196,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 	if newVar {
 		assign = ":="
 	}
-	name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+	name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 	buffer.WriteString(fmt.Sprintf("%s %s %s%s{%s}\n", targetVar, assign, deref, name, initCode))
 	buffer.WriteString(postInitCode)
 
@@ -224,6 +223,10 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 			case expr.IsUnion(srcc.Type):
 				code, err = transformUnion(srcc, tgtc, srcVar, tgtVar, false, ta)
 			case ok:
+				if ta.TargetCtx.isInterface {
+					ref := ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target))
+					tgtVar = targetVar + ".(" + ref + ")." + GoifyAtt(tgtc, tgtMatt.ElemName(n), true)
+				}
 				if !expr.IsPrimitive(srcc.Type) {
 					code = fmt.Sprintf("%s = %s(%s)\n", tgtVar, transformHelperName(srcc, tgtc, ta), srcVar)
 				}
@@ -274,7 +277,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 					code += fmt.Sprintf("var zero %s\n\t", typeName)
 				} else if _, ok := tgtc.Type.(expr.UserType); ok {
 					// aliased primitive
-					code += fmt.Sprintf("var zero %s\n\t", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg))
+					code += fmt.Sprintf("var zero %s\n\t", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg(tgtc)))
 				} else {
 					code += fmt.Sprintf("var zero %s\n\t", GoNativeTypeName(tgtc.Type))
 				}
@@ -297,7 +300,7 @@ func transformArray(source, target *expr.Array, sourceVar, targetVar string, new
 		return "", err
 	}
 	data := map[string]interface{}{
-		"ElemTypeRef":    ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg),
+		"ElemTypeRef":    ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg(target.ElemType)),
 		"SourceElem":     source.ElemType,
 		"TargetElem":     target.ElemType,
 		"SourceVar":      sourceVar,
@@ -323,8 +326,8 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 		return "", err
 	}
 	data := map[string]interface{}{
-		"KeyTypeRef":     ta.TargetCtx.Scope.Ref(target.KeyType, ta.TargetCtx.Pkg),
-		"ElemTypeRef":    ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg),
+		"KeyTypeRef":     ta.TargetCtx.Scope.Ref(target.KeyType, ta.TargetCtx.Pkg(target.KeyType)),
+		"ElemTypeRef":    ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg(target.ElemType)),
 		"SourceKey":      source.KeyType,
 		"TargetKey":      target.KeyType,
 		"SourceElem":     source.ElemType,
@@ -348,6 +351,10 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 }
 
 // transformUnion generates Go code to transform source union to target union.
+//
+// Note: transport to/from service transforms are always object to union or
+// union to object. The only case a transform is union to union is when
+// converting a projected type from/to a service type.
 func transformUnion(source, target *expr.AttributeExpr, sourceVar, targetVar string, newVar bool, ta *TransformAttrs) (string, error) {
 	if expr.IsObject(target.Type) {
 		return transformUnionToObject(source, target, sourceVar, targetVar, newVar, ta)
@@ -365,12 +372,16 @@ func transformUnion(source, target *expr.AttributeExpr, sourceVar, targetVar str
 	}
 	sourceTypeRefs := make([]string, len(srcUnion.Values))
 	for i, st := range srcUnion.Values {
-		sourceTypeRefs[i] = ta.TargetCtx.Scope.Ref(st.Attribute, ta.TargetCtx.Pkg)
+		sourceTypeRefs[i] = ta.TargetCtx.Scope.Ref(st.Attribute, ta.SourceCtx.Pkg(st.Attribute))
 	}
 	targetTypeNames := make([]string, len(tgtUnion.Values))
 	for i, tt := range tgtUnion.Values {
-		targetTypeNames[i] = ta.TargetCtx.Scope.Name(tt.Attribute, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.Pointer)
+		targetTypeNames[i] = ta.TargetCtx.Scope.Name(tt.Attribute, ta.TargetCtx.Pkg(tt.Attribute), ta.TargetCtx.Pointer, ta.TargetCtx.Pointer)
 	}
+
+	// Need to type assert targetVar before assigning field values.
+	ta.TargetCtx.isInterface = true
+
 	data := map[string]interface{}{
 		"SourceTypeRefs": sourceTypeRefs,
 		"SourceTypes":    srcUnion.Values,
@@ -378,8 +389,8 @@ func transformUnion(source, target *expr.AttributeExpr, sourceVar, targetVar str
 		"SourceVar":      sourceVar,
 		"TargetVar":      targetVar,
 		"NewVar":         newVar,
-		"TypeRef":        ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
-		"TargetTypeName": ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
+		"TypeRef":        ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
+		"TargetTypeName": ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
 		"TransformAttrs": ta,
 	}
 	var buf bytes.Buffer
@@ -394,24 +405,24 @@ func transformUnionToObject(source, target *expr.AttributeExpr, sourceVar, targe
 	if (*obj)[0].Attribute.Type != expr.String {
 		return "", fmt.Errorf("union to object transform requires first field to be string")
 	}
-	if (*obj)[1].Attribute.Type != expr.Any {
-		return "", fmt.Errorf("union to object transform requires second field to be any")
+	if (*obj)[1].Attribute.Type != expr.String {
+		return "", fmt.Errorf("union to object transform requires second field to be string")
 	}
 	srcUnion := expr.AsUnion(source.Type)
 	sourceTypeRefs := make([]string, len(srcUnion.Values))
 	sourceTypeNames := make([]string, len(srcUnion.Values))
 	for i, st := range srcUnion.Values {
-		sourceTypeRefs[i] = ta.SourceCtx.Scope.Ref(st.Attribute, ta.SourceCtx.Pkg)
-		sourceTypeNames[i] = ta.SourceCtx.Scope.Name(st.Attribute, "", false, false)
+		sourceTypeRefs[i] = ta.SourceCtx.Scope.Ref(st.Attribute, ta.SourceCtx.Pkg(st.Attribute))
+		sourceTypeNames[i] = st.Name
 	}
 	data := map[string]interface{}{
 		"NewVar":          newVar,
 		"TargetVar":       targetVar,
-		"TypeRef":         ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
+		"TypeRef":         ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
 		"SourceVar":       sourceVar,
 		"SourceTypeRefs":  sourceTypeRefs,
 		"SourceTypeNames": sourceTypeNames,
-		"TargetTypeName":  ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
+		"TargetTypeName":  ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
 	}
 	var buf bytes.Buffer
 	if err := transformGoUnionToObjectT.Execute(&buf, data); err != nil {
@@ -425,8 +436,8 @@ func transformObjectToUnion(source, target *expr.AttributeExpr, sourceVar, targe
 	if (*obj)[0].Attribute.Type != expr.String {
 		return "", fmt.Errorf("union to object transform requires first field to be string")
 	}
-	if (*obj)[1].Attribute.Type != expr.Any {
-		return "", fmt.Errorf("union to object transform requires second field to be any")
+	if (*obj)[1].Attribute.Type != expr.String {
+		return "", fmt.Errorf("union to object transform requires second field to be string")
 	}
 
 	sourceVarDeref := sourceVar
@@ -434,21 +445,22 @@ func transformObjectToUnion(source, target *expr.AttributeExpr, sourceVar, targe
 		sourceVarDeref = "*" + sourceVar
 	}
 	tgtUnion := expr.AsUnion(target.Type)
-	targetTypeNames := make([]string, len(tgtUnion.Values))
+	unionTypes := make([]string, len(tgtUnion.Values))
 	targetTypeRefs := make([]string, len(tgtUnion.Values))
 	for i, tt := range tgtUnion.Values {
-		targetTypeNames[i] = ta.TargetCtx.Scope.Name(tt.Attribute, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.Pointer)
-		targetTypeRefs[i] = ta.TargetCtx.Scope.Ref(tt.Attribute, ta.TargetCtx.Pkg)
+		unionTypes[i] = tt.Name
+		targetTypeRefs[i] = ta.TargetCtx.Scope.Ref(tt.Attribute, ta.TargetCtx.Pkg(tt.Attribute))
 	}
 	data := map[string]interface{}{
-		"NewVar":          newVar,
-		"TargetVar":       targetVar,
-		"TypeRef":         ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
-		"SourceVar":       sourceVar,
-		"SourceVarDeref":  sourceVarDeref,
-		"TargetTypeNames": targetTypeNames,
-		"TargetTypeRefs":  targetTypeRefs,
-		"TargetTypeName":  ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
+		"NewVar":         newVar,
+		"TargetVar":      targetVar,
+		"TypeRef":        ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
+		"SourceVar":      sourceVar,
+		"SourceVarDeref": sourceVarDeref,
+		"UnionTypes":     unionTypes,
+		"TargetTypeRefs": targetTypeRefs,
+		"TargetTypeName": ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault),
+		"Pointer":        ta.SourceCtx.Pointer,
 	}
 	var buf bytes.Buffer
 	if err := transformGoObjectToUnionT.Execute(&buf, data); err != nil {
@@ -469,7 +481,6 @@ func transformObjectToUnion(source, target *expr.AttributeExpr, sourceVar, targe
 // ta holds the transform attributes
 //
 // seen keeps track of generated transform functions to avoid infinite recursion.
-//
 func transformAttributeHelpers(source, target *expr.AttributeExpr, ta *TransformAttrs, seen map[string]*TransformFunctionData) (helpers []*TransformFunctionData, err error) {
 	// Do not generate a transform function for the top most user type.
 	var other []*TransformFunctionData
@@ -577,6 +588,11 @@ func generateHelper(source, target *expr.AttributeExpr, req bool, ta *TransformA
 	if _, ok := seen[name]; ok {
 		return nil, nil
 	}
+
+	// Reset need for type assertion for union types because we are
+	// generating the code to transform the concrete type.
+	ta.TargetCtx.isInterface = false
+
 	code, err := transformAttribute(source.Type.(expr.UserType).Attribute(), target, "v", "res", true, ta)
 	if err != nil {
 		return nil, err
@@ -586,8 +602,8 @@ func generateHelper(source, target *expr.AttributeExpr, req bool, ta *TransformA
 	}
 	tfd := &TransformFunctionData{
 		Name:          name,
-		ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg),
-		ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
+		ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source)),
+		ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
 		Code:          code,
 	}
 	seen[name] = tfd
@@ -619,8 +635,8 @@ func transformHelperName(source, target *expr.AttributeExpr, ta *TransformAttrs)
 		prefix string
 	)
 	{
-		sname = Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg, ta.SourceCtx.Pointer, ta.SourceCtx.UseDefault), true)
-		tname = Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
+		sname = Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg(source), ta.SourceCtx.Pointer, ta.SourceCtx.UseDefault), true)
+		tname = Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
 		prefix = ta.Prefix
 		if prefix == "" {
 			prefix = "transform"
@@ -660,14 +676,14 @@ for key, val := range {{ .SourceVar }} {
 {{ end }}switch actual := {{ .SourceVar }}.(type) {
 	{{- range $i, $ref := .SourceTypeRefs }}
 	case {{ $ref }}:
-		{{ transformAttribute (index $.SourceTypes $i).Attribute (index $.TargetTypes $i).Attribute "actual" "val" true $.TransformAttrs -}}
-		{{ $.TargetVar }} = {{ $.TargetTypeName }}{ Value: val }
+		{{- transformAttribute (index $.SourceTypes $i).Attribute (index $.TargetTypes $i).Attribute "actual" $.TargetVar false $.TransformAttrs -}}
 	{{- end }}
 }
 `
 
 	transformGoUnionToObjectTmpl = `{{ if .NewVar }}var {{ .TargetVar }} {{ .TypeRef }}
-{{ end }}var name string
+{{ end }}js, _ := json.Marshal({{ .SourceVar }})
+var name string
 switch {{ .SourceVar }}.(type) {
 	{{- range $i, $ref := .SourceTypeRefs }}
 	case {{ $ref }}:
@@ -676,15 +692,17 @@ switch {{ .SourceVar }}.(type) {
 }
 {{ .TargetVar }} = &{{ .TargetTypeName }}{
 	Type: name,
-	Value: {{ .SourceVar }},
+	Value: string(js),
 }
 `
 
 	transformGoObjectToUnionTmpl = `{{ if .NewVar }}var {{ .TargetVar }} {{ .TypeRef }}
 {{ end }}switch {{ .SourceVarDeref }}.Type {
-	{{- range $i, $name := .TargetTypeNames }}
+	{{- range $i, $name := .UnionTypes }}
 	case {{ printf "%q" $name }}:
-		{{ $.TargetVar }} = {{ $.SourceVar }}.Value.({{ index $.TargetTypeRefs $i }})
+		var val {{ index $.TargetTypeRefs $i }}
+		json.Unmarshal([]byte({{ if $.Pointer }}*{{ end }}{{ $.SourceVar }}.Value), &val)
+		{{ $.TargetVar }} = val
 	{{- end }}
 }
 `

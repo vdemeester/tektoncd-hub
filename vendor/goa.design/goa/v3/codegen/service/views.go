@@ -49,6 +49,15 @@ func ViewsFile(genpkg string, service *expr.ServiceExpr) *codegen.File {
 			})
 		}
 
+		// Union methods
+		for _, m := range svc.viewedUnionMethods {
+			sections = append(sections, &codegen.SectionTemplate{
+				Name:   "viewed-union-value-method",
+				Source: unionValueMethodT,
+				Data:   m,
+			})
+		}
+
 		// generate a map for result types with view name as key and the fields
 		// rendered in the view as value.
 		var (
