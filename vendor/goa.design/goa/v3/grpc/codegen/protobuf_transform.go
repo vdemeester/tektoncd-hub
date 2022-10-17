@@ -77,7 +77,6 @@ func init() {
 // newVar if true initializes a target variable with the generated Go code
 // using `:=` operator. If false, it assigns Go code to the target variable
 // using `=`.
-//
 func protoBufTransform(source, target *expr.AttributeExpr, sourceVar, targetVar string, sourceCtx, targetCtx *codegen.AttributeContext, proto, newVar bool) (string, []*codegen.TransformFunctionData, error) {
 	ta := &transformAttrs{TransformAttrs: &codegen.TransformAttrs{
 		SourceCtx: sourceCtx,
@@ -131,7 +130,7 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		if ta.proto {
-			name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			name := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			initCode += fmt.Sprintf("%s := &%s{}\n", targetVar, name)
 			targetVar += ".Field"
 			newVar = false
@@ -148,12 +147,12 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 	if ta.proto {
 		if isUnionMessage(target) {
 			ta = dupTransformAttrs(ta)
-			ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, false, false)
+			ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), false, false)
 		}
 	} else {
 		if isUnionMessage(source) {
 			ta = dupTransformAttrs(ta)
-			ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg)
+			ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source))
 		}
 	}
 
@@ -168,16 +167,16 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 			code, err = transformObject(source, target, sourceVar, targetVar, newVar, ta)
 		case expr.IsUnion(source.Type):
 			if ta.proto {
-				code, err = transformUnionToProto(source, target, sourceVar, targetVar, newVar, ta)
+				code, err = transformUnionToProto(source, target, sourceVar, targetVar, ta)
 			} else {
-				code, err = transformUnionFromProto(source, target, sourceVar, targetVar, newVar, ta)
+				code, err = transformUnionFromProto(source, target, sourceVar, targetVar, ta)
 			}
 		default:
 			assign := "="
 			if newVar {
 				assign = ":="
 			}
-			srcField := convertType(source, target, sourceVar, ta)
+			srcField := convertType(source, target, false, false, sourceVar, ta)
 			code = fmt.Sprintf("%s %s %s\n", targetVar, assign, srcField)
 		}
 	}
@@ -202,45 +201,54 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 				return
 			}
 			var (
-				srcField = sourceVar + "." + ta.SourceCtx.Scope.Field(srcc, srcMatt.ElemName(n), true)
-				tgtField = ta.TargetCtx.Scope.Field(tgtc, tgtMatt.ElemName(n), true)
-				srcPtr   = ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr)
-				tgtPtr   = ta.TargetCtx.IsPrimitivePointer(n, tgtMatt.AttributeExpr)
+				exp          string
+				srcField     = sourceVar + "." + ta.SourceCtx.Scope.Field(srcc, srcMatt.ElemName(n), true)
+				tgtField     = ta.TargetCtx.Scope.Field(tgtc, tgtMatt.ElemName(n), true)
+				srcPtr       = ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr)
+				tgtPtr       = ta.TargetCtx.IsPrimitivePointer(n, tgtMatt.AttributeExpr)
+				srcFieldConv = convertType(srcc, tgtc, srcPtr, tgtPtr, srcField, ta)
+				_, isSrcUT   = srcc.Type.(expr.UserType)
+				_, isTgtUT   = tgtc.Type.(expr.UserType)
 			)
-			srcFieldConv := convertType(srcc, tgtc, srcField, ta)
 			switch {
-			case srcPtr && !tgtPtr:
-				postInitCode += fmt.Sprintf("if %s != nil {\n\t%s.%s = %s\n}\n", srcField, targetVar, tgtField, convertType(srcc, tgtc, "*"+srcField, ta))
-				return
-			case !srcPtr && tgtPtr:
-				// In protocol buffer version 3, there is no concept of an optional
-				// message field, i.e., a message field is always initialized with the
-				// type's zero value - https://developers.google.com/protocol-buffers/docs/proto3#default
-				// So if the attribute in the service type is an optional attribute and
-				// the corresponding protocol buffer field contains a zero value then
-				// we set the optional attribute as nil.
-				// We don't check for zero values for booleans since by default, protocol
-				// buffer sets boolean fields as false.
-				if !srcMatt.IsRequired(n) && srcc.Type != expr.Boolean {
-					postInitCode += fmt.Sprintf("if %s {\n\t", checkZeroValue(srcc.Type, srcField, true))
-					if srcField != srcFieldConv {
-						// type conversion required. Add it in postinit code.
-						tgtName := codegen.Goify(tgtField, false)
-						postInitCode += fmt.Sprintf("%sptr := %s\n%s.%s = &%sptr", tgtName, srcFieldConv, targetVar, tgtField, tgtName)
+			case isSrcUT || isTgtUT || (srcField != srcFieldConv):
+				var deref string
+				if srcPtr {
+					deref = "*"
+				}
+				exp = srcFieldConv
+				if isSrcUT && !ta.proto {
+					// If the source is an alias type and the code is initializing a service
+					// type then we must cast to the alias type.
+					exp = fmt.Sprintf("%s(%s%s)", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg(tgtc)), deref, srcField)
+				}
+				if srcPtr && !srcMatt.IsRequired(n) {
+					postInitCode += fmt.Sprintf("if %s != nil {\n", srcField)
+					if tgtPtr {
+						tmp := codegen.Goify(tgtMatt.ElemName(n), false)
+						postInitCode += fmt.Sprintf("%s := %s\n%s.%s = &%s\n", tmp, exp, targetVar, tgtField, tmp)
 					} else {
-						postInitCode += fmt.Sprintf("%s.%s = &%s", targetVar, tgtField, srcFieldConv)
+						postInitCode += fmt.Sprintf("%s.%s = %s\n", targetVar, tgtField, exp)
 					}
-					postInitCode += "\n}\n"
+					postInitCode += "}\n"
 					return
-				} else if srcField != srcFieldConv {
-					// type conversion required. Add it in postinit code.
-					tgtName := codegen.Goify(tgtField, false)
-					postInitCode += fmt.Sprintf("%sptr := %s\n%s.%s = &%sptr\n", tgtName, srcFieldConv, targetVar, tgtField, tgtName)
+				} else if tgtPtr {
+					tmp := codegen.Goify(tgtMatt.ElemName(n), false)
+					postInitCode += fmt.Sprintf("%s := %s\n%s.%s = &%s\n", tmp, exp, targetVar, tgtField, tmp)
 					return
 				}
-				srcFieldConv = "&" + srcFieldConv
+			case srcPtr && !tgtPtr:
+				exp = "*" + srcField
+				if !srcMatt.IsRequired(n) {
+					postInitCode += fmt.Sprintf("if %s != nil {\n\t%s.%s = %s\n}\n", srcField, targetVar, tgtField, exp)
+					return
+				}
+			case !srcPtr && tgtPtr:
+				exp = "&" + srcField
+			default:
+				exp = srcField
 			}
-			initCode += fmt.Sprintf("\n%s: %s,", tgtField, srcFieldConv)
+			initCode += fmt.Sprintf("\n%s: %s,", tgtField, exp)
 		})
 		if initCode != "" {
 			initCode += "\n"
@@ -257,7 +265,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 	if newVar {
 		assign = ":="
 	}
-	tname := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+	tname := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 	buffer.WriteString(fmt.Sprintf("%s %s %s%s{%s}\n", targetVar, assign, deref, tname, initCode))
 	buffer.WriteString(postInitCode)
 
@@ -276,7 +284,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 		{
 			if err = codegen.IsCompatible(srcc.Type, tgtc.Type, "", ""); err != nil {
 				if ta.proto {
-					ta.targetInit = ta.TargetCtx.Scope.Name(tgtc, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+					ta.targetInit = ta.TargetCtx.Scope.Name(tgtc, ta.TargetCtx.Pkg(tgtc), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 					tgtc = unwrapAttr(tgtc)
 				} else {
 					srcc = unwrapAttr(srcc)
@@ -286,14 +294,20 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 					return
 				}
 			}
-			_, ok := srcc.Type.(expr.UserType)
+			_, isUserType := srcc.Type.(expr.UserType)
 			switch {
 			case expr.IsArray(srcc.Type):
 				code, err = transformArray(expr.AsArray(srcc.Type), expr.AsArray(tgtc.Type), srcVar, tgtVar, false, ta)
 			case expr.IsMap(srcc.Type):
 				code, err = transformMap(expr.AsMap(srcc.Type), expr.AsMap(tgtc.Type), srcVar, tgtVar, false, ta)
-			case ok:
-				code = fmt.Sprintf("%s = %s\n", tgtVar, convertType(srcc, tgtc, srcVar, ta))
+			case isUserType:
+				if ta.TargetCtx.IsInterface {
+					ref := ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target))
+					tgtVar = targetVar + ".(" + ref + ")." + codegen.GoifyAtt(tgtc, tgtMatt.ElemName(n), true)
+				}
+				if !expr.IsPrimitive(srcc.Type) {
+					code = fmt.Sprintf("%s = %s(%s)\n", tgtVar, transformHelperName(srcc, tgtc, ta), srcVar)
+				}
 			case expr.IsObject(srcc.Type):
 				code, err = transformAttribute(srcc, tgtc, srcVar, tgtVar, false, ta)
 			case expr.IsUnion(srcc.Type):
@@ -313,7 +327,9 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 		// and to avoid derefencing nil.
 		var checkNil bool
 		{
-			checkNil = !expr.IsPrimitive(srcc.Type) || ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr)
+			isRef := !expr.IsPrimitive(srcc.Type) && !srcMatt.IsRequired(n) || ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr) && expr.IsPrimitive(srcc.Type)
+			marshalNonPrimitive := !expr.IsPrimitive(srcc.Type)
+			checkNil = isRef || marshalNonPrimitive
 		}
 		if code != "" && checkNil {
 			code = fmt.Sprintf("if %s != nil {\n\t%s}\n", srcVar, code)
@@ -322,40 +338,39 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 		// Default value handling. We need to handle default values if the target
 		// type uses default values (i.e. attributes with default values are
 		// non-pointers) and has a default value set.
-		if tdef := tgtc.DefaultValue; tdef != nil && ta.TargetCtx.UseDefault {
-			if ta.proto {
-				// We set default values in protocol buffer type only if the source type
-				// uses pointers to hold default values.
-				if ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr) {
-					code += fmt.Sprintf("if %s == nil {\n\t%s = %#v\n}\n", srcVar, tgtVar, tdef)
-				} else if !expr.IsPrimitive(srcc.Type) && !srcMatt.IsRequired(n) {
-					code += fmt.Sprintf("if %s {\n\t%s = %#v\n}\n", checkZeroValue(srcc.Type, srcVar, false), tgtVar, tdef)
+		if tdef := tgtMatt.GetDefault(n); tdef != nil && ta.TargetCtx.UseDefault && !ta.TargetCtx.Pointer && !srcMatt.IsRequired(n) {
+			switch {
+			case ta.SourceCtx.IsPrimitivePointer(n, srcMatt.AttributeExpr) || !expr.IsPrimitive(srcc.Type):
+				// source attribute is a primitive pointer or not a primitive
+				code += fmt.Sprintf("if %s == nil {\n\t", srcVar)
+				if ta.TargetCtx.IsPrimitivePointer(n, tgtMatt.AttributeExpr) && expr.IsPrimitive(tgtc.Type) {
+					nativeTypeName := codegen.GoNativeTypeName(tgtc.Type)
+					if ta.proto {
+						nativeTypeName = protoBufNativeGoTypeName(tgtc.Type)
+					}
+					code += fmt.Sprintf("var tmp %s = %#v\n\t%s = &tmp\n", nativeTypeName, tdef, tgtVar)
+				} else {
+					code += fmt.Sprintf("%s = %#v\n", tgtVar, tdef)
 				}
-			} else {
-				// In protocol buffer version 3, the optional attributes are always
-				// initialized with their zero values - https://developers.google.com/protocol-buffers/docs/proto3#default
-				// Therefore, we always initialize optional fields in the target with
-				// their default values if the corresponding source fields have zero
-				// values.
-				// We don't set default values for booleans since by default, protocol
-				// buffer sets boolean fields as false.
-				if !srcMatt.IsRequired(n) && srcc.Type != expr.Boolean {
+				code += "}\n"
+			case expr.IsPrimitive(srcc.Type) && srcMatt.HasDefaultValue(n) && ta.SourceCtx.UseDefault:
+				// source attribute is a primitive with default value
+				// (the field is not a pointer in this case)
+				code += "{\n\t"
+				if ta.proto {
+					code += fmt.Sprintf("var zero %s\n\t", protoBufNativeGoTypeName(tgtc.Type))
+				} else {
 					if typeName, _ := codegen.GetMetaType(tgtc); typeName != "" {
 						code += fmt.Sprintf("var zero %s\n\t", typeName)
-						code += fmt.Sprintf("if %s == zero {\n\t", srcVar)
+					} else if _, ok := tgtc.Type.(expr.UserType); ok {
+						// aliased primitive
+						code += fmt.Sprintf("var zero %s\n\t", ta.TargetCtx.Scope.Ref(tgtc, ta.TargetCtx.Pkg(tgtc)))
 					} else {
-						check := checkZeroValue(srcc.Type, srcVar, false)
-						if check != "" {
-							code += fmt.Sprintf("if %s {\n\t", check)
-						}
+						code += fmt.Sprintf("var zero %s\n\t", codegen.GoNativeTypeName(tgtc.Type))
 					}
-					if ta.TargetCtx.IsPrimitivePointer(n, tgtMatt.AttributeExpr) && expr.IsPrimitive(tgtc.Type) {
-						code += fmt.Sprintf("var tmp %s = %#v\n\t%s = &tmp\n", codegen.GoNativeTypeName(tgtc.Type), tdef, tgtVar)
-					} else {
-						code += fmt.Sprintf("%s = %#v\n", tgtVar, tdef)
-					}
-					code += "}\n"
 				}
+				code += fmt.Sprintf("if %s == zero {\n\t%s = %#v\n}\n", tgtVar, tgtVar, tdef)
+				code += "}\n"
 			}
 		}
 		buffer.WriteString(code)
@@ -371,7 +386,11 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 // type to target attribute of array type. It returns an error if source
 // and target are not compatible for transformation.
 func transformArray(source, target *expr.Array, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
-	targetRef := ta.TargetCtx.Scope.Ref(target.ElemType, ta.TargetCtx.Pkg)
+	elem := target.ElemType
+	if ta.proto {
+		elem = unAlias(elem)
+	}
+	targetRef := ta.TargetCtx.Scope.Ref(elem, ta.TargetCtx.Pkg(elem))
 
 	var (
 		code string
@@ -399,10 +418,10 @@ func transformArray(source, target *expr.Array, sourceVar, targetVar string, new
 	}
 
 	src := source.ElemType
-	tgt := target.ElemType
+	tgt := elem
 	if err = codegen.IsCompatible(src.Type, tgt.Type, "[0]", "[0]"); err != nil {
 		if ta.proto {
-			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg(tgt), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			tgt = unwrapAttr(expr.DupAtt(tgt))
 		} else {
 			src = unwrapAttr(expr.DupAtt(src))
@@ -447,8 +466,8 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 	if ta.proto {
 		et = unAlias(et)
 	}
-	targetKeyRef := ta.TargetCtx.Scope.Ref(kt, ta.TargetCtx.Pkg)
-	targetElemRef := ta.TargetCtx.Scope.Ref(et, ta.TargetCtx.Pkg)
+	targetKeyRef := ta.TargetCtx.Scope.Ref(kt, ta.TargetCtx.Pkg(kt))
+	targetElemRef := ta.TargetCtx.Scope.Ref(et, ta.TargetCtx.Pkg(et))
 
 	var (
 		code string
@@ -479,7 +498,7 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 	tgt := target.ElemType
 	if err = codegen.IsCompatible(src.Type, tgt.Type, "[*]", "[*]"); err != nil {
 		if ta.proto {
-			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
+			ta.targetInit = ta.TargetCtx.Scope.Name(tgt, ta.TargetCtx.Pkg(tgt), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
 			tgt = unwrapAttr(expr.DupAtt(tgt))
 		} else {
 			src = unwrapAttr(expr.DupAtt(src))
@@ -515,11 +534,11 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 // transformUnionToProto returns the code to transform an attribute of type
 // union from Goa to protobuf. It returns an error if source and target are not
 // compatible for transformation.
-func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
+func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) (string, error) {
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		return "", err
 	}
-	tdata := transformUnionData(source, target, sourceVar, targetVar, ta)
+	tdata := transformUnionData(source, target, ta)
 	targetValueTypeNames := make([]string, len(tdata.TargetValues))
 	targetFieldNames := make([]string, len(tdata.TargetValues))
 	for i, v := range tdata.TargetValues {
@@ -548,11 +567,11 @@ func transformUnionToProto(source, target *expr.AttributeExpr, sourceVar, target
 // transformUnionFromProto returns the code to transform an attribute of type
 // union from Goa to protobuf. It returns an error if source and target are not
 // compatible for transformation.
-func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, newVar bool, ta *transformAttrs) (string, error) {
+func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) (string, error) {
 	if err := codegen.IsCompatible(source.Type, target.Type, sourceVar, targetVar); err != nil {
 		return "", err
 	}
-	tdata := transformUnionData(source, target, sourceVar, targetVar, ta)
+	tdata := transformUnionData(source, target, ta)
 	sourceFieldNames := make([]string, len(tdata.SourceValues))
 	for i, v := range tdata.SourceValues {
 		fieldName := ta.SourceCtx.Scope.Field(v.Attribute, v.Name, true)
@@ -577,16 +596,14 @@ func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targ
 
 // convertType produces code to initialize a target type from a source type
 // held by sourceVar.
-// NOTE: For Int and UInt kinds, protocol buffer Go compiler generates
-// int32 and uint32 respectively whereas goa v2 generates int and uint.
-func convertType(src, tgt *expr.AttributeExpr, srcVar string, ta *transformAttrs) string {
+func convertType(src, tgt *expr.AttributeExpr, srcPtr bool, tgtPtr bool, srcVar string, ta *transformAttrs) string {
 	if expr.IsAlias(src.Type) || expr.IsAlias(tgt.Type) {
 		srcp, tgtp := unAlias(src), unAlias(tgt)
 		if srcp.Type == tgtp.Type {
 			if ta.proto {
-				return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgtp), srcVar)
+				return convertPrimitiveToProto(src, tgtp, srcPtr, tgtPtr, srcVar, ta)
 			}
-			return fmt.Sprintf("%s(%s)", ta.TargetCtx.Scope.Ref(tgt, ta.TargetCtx.Pkg), srcVar)
+			return convertPrimitiveFromProto(srcp, tgt, srcPtr, tgtPtr, srcVar, ta)
 		}
 		return fmt.Sprintf("%s(%s)", transformHelperName(src, tgt, ta), srcVar)
 	}
@@ -597,52 +614,42 @@ func convertType(src, tgt *expr.AttributeExpr, srcVar string, ta *transformAttrs
 
 	srcType, _ := codegen.GetMetaType(src)
 	tgtType, _ := codegen.GetMetaType(tgt)
-	if src.Type != expr.Int && src.Type != expr.UInt {
-		if srcType != "" || tgtType != "" {
-			if ta.proto || tgtType == "" {
-				tgtType = protoBufNativeGoTypeName(tgt)
-			}
-			return fmt.Sprintf("%s(%s)", tgtType, srcVar)
-		}
+	if srcType == "" && tgtType == "" && (src.Type != expr.Int) && (src.Type != expr.UInt) {
+		// Nothing to do
 		return srcVar
 	}
 
 	if ta.proto {
-		return fmt.Sprintf("%s(%s)", protoBufNativeGoTypeName(tgt), srcVar)
+		return convertPrimitiveToProto(src, tgt, srcPtr, tgtPtr, srcVar, ta)
 	}
-	if tgtType == "" {
-		tgtType = codegen.GoNativeTypeName(tgt.Type)
+	return convertPrimitiveFromProto(src, tgt, srcPtr, tgtPtr, srcVar, ta)
+}
+
+// convertPrimitive returns the code to convert a primitive type from one
+// representation to another.
+// NOTE: For Int and UInt kinds, protocol buffer Go compiler generates
+// int32 and uint32 respectively whereas Goa generates int and uint.
+func convertPrimitiveToProto(src, tgt *expr.AttributeExpr, srcPtr, tgtPtr bool, srcVar string, ta *transformAttrs) string {
+	tgtType := protoBufNativeGoTypeName(tgt.Type)
+	if srcPtr {
+		srcVar = "*" + srcVar
 	}
 	return fmt.Sprintf("%s(%s)", tgtType, srcVar)
 }
 
-// zeroValure returns the zero value for the given primitive type.
-func checkZeroValue(dt expr.DataType, target string, negate bool) string {
-	kind := dt.Kind()
-	if p := getPrimitive(&expr.AttributeExpr{Type: dt}); p != nil {
-		kind = p.Type.Kind()
+func convertPrimitiveFromProto(src, tgt *expr.AttributeExpr, srcPtr, tgtPtr bool, srcVar string, ta *transformAttrs) string {
+	tgtType, _ := codegen.GetMetaType(tgt)
+	if tgtType == "" {
+		tgtType = ta.TargetCtx.Scope.Ref(tgt, ta.TargetCtx.Pkg(tgt))
 	}
-	eq := "=="
-	if negate {
-		eq = "!="
+	if srcPtr {
+		srcVar = "*" + srcVar
 	}
-	// don't check for BooleanKind since by default boolean is set to false
-	switch kind {
-	case expr.IntKind, expr.Int32Kind, expr.Int64Kind,
-		expr.UIntKind, expr.UInt32Kind, expr.UInt64Kind,
-		expr.Float32Kind, expr.Float64Kind:
-		return fmt.Sprintf("%s %s 0", target, eq)
-	case expr.StringKind:
-		return fmt.Sprintf("%s %s \"\"", target, eq)
-	case expr.BytesKind, expr.ArrayKind, expr.MapKind:
-		return fmt.Sprintf("len(%s) %s 0", target, eq)
-	default:
-		return fmt.Sprintf("%s %s nil", target, eq)
-	}
+	return fmt.Sprintf("%s(%s)", tgtType, srcVar)
 }
 
 // transformUnionData returns data needed by both transformUnion functions.
-func transformUnionData(source, target *expr.AttributeExpr, sourceVar, targetVar string, ta *transformAttrs) *unionData {
+func transformUnionData(source, target *expr.AttributeExpr, ta *transformAttrs) *unionData {
 	src := expr.AsUnion(source.Type)
 	tgt := expr.AsUnion(target.Type)
 	srcValues := make([]*expr.NamedAttributeExpr, len(src.Values))
@@ -653,7 +660,7 @@ func transformUnionData(source, target *expr.AttributeExpr, sourceVar, targetVar
 	sourceValueTypeRefs := make([]string, len(src.Values))
 	for i, v := range src.Values {
 		if ta.proto {
-			sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg)
+			sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg(v.Attribute))
 		} else {
 			fieldName := ta.SourceCtx.Scope.Field(v.Attribute, v.Name, true)
 			sourceValueTypeRefs[i] = ta.message + "_" + fieldName
@@ -677,7 +684,6 @@ func transformUnionData(source, target *expr.AttributeExpr, sourceVar, targetVar
 // ta is the transform attributes
 //
 // seen keeps track of generated transform functions to avoid recursion
-//
 func transformAttributeHelpers(source, target *expr.AttributeExpr, ta *transformAttrs, seen map[string]*codegen.TransformFunctionData) ([]*codegen.TransformFunctionData, error) {
 	var (
 		helpers []*codegen.TransformFunctionData
@@ -724,7 +730,7 @@ func transformAttributeHelpers(source, target *expr.AttributeExpr, ta *transform
 				}
 			}
 		case expr.IsObject(source.Type):
-			walkMatches(source, target, func(srcMatt, tgtMatt *expr.MappedAttributeExpr, srcc, tgtc *expr.AttributeExpr, n string) {
+			walkMatches(source, target, func(srcMatt, _ *expr.MappedAttributeExpr, srcc, tgtc *expr.AttributeExpr, n string) {
 				if err != nil {
 					return
 				}
@@ -810,12 +816,12 @@ func collectHelpers(source, target *expr.AttributeExpr, req bool, ta *transformA
 			if ta.proto {
 				if isUnionMessage(target) {
 					ta = dupTransformAttrs(ta)
-					ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, false, false)
+					ta.message = ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), false, false)
 				}
 			} else {
 				if isUnionMessage(source) {
 					ta = dupTransformAttrs(ta)
-					ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg)
+					ta.message = ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source))
 				}
 			}
 			name := transformHelperName(source, target, ta)
@@ -831,8 +837,8 @@ func collectHelpers(source, target *expr.AttributeExpr, req bool, ta *transformA
 			}
 			tfd := &codegen.TransformFunctionData{
 				Name:          name,
-				ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg),
-				ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg),
+				ParamTypeRef:  ta.SourceCtx.Scope.Ref(source, ta.SourceCtx.Pkg(source)),
+				ResultTypeRef: ta.TargetCtx.Scope.Ref(target, ta.TargetCtx.Pkg(target)),
 				Code:          code,
 			}
 			seen[name] = tfd
@@ -891,8 +897,8 @@ func transformHelperName(source, target *expr.AttributeExpr, ta *transformAttrs)
 		prefix string
 	)
 	{
-		sname = codegen.Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
-		tname = codegen.Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg, ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
+		sname = codegen.Goify(ta.SourceCtx.Scope.Name(source, ta.SourceCtx.Pkg(source), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
+		tname = codegen.Goify(ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault), true)
 		prefix = ta.Prefix
 	}
 	return codegen.Goify(prefix+sname+"To"+tname, false)
@@ -936,7 +942,7 @@ func dupTransformAttrs(ta *transformAttrs) *transformAttrs {
 }
 
 const (
-	transformGoArrayTmpl = `{{ .TargetVar }} {{ if .NewVar }}:={{ else }}={{ end }} make([]{{ .ElemTypeRef }}, len({{ .SourceVar }}))
+	transformGoArrayTmpl = `{{ .TargetVar }} {{ if .NewVar }}:={{ else }}={{ end }} make([]{{ .ElemTypeRef }}, len({{ .SourceVar }})) 
 for {{ .LoopVar }}, val := range {{ .SourceVar }} {
   {{ transformAttribute .SourceElem .TargetElem "val" (printf "%s[%s]" .TargetVar .LoopVar) false .TransformAttrs -}}
 }
@@ -953,16 +959,18 @@ for key, val := range {{ .SourceVar }} {
 	transformGoUnionToProtoTmpl = `switch src := {{ .SourceVar }}.(type) {
 {{- range $i, $ref := .SourceValueTypeRefs }}
 case {{ . }}:
-		{{- $val := (convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute "src" $.TransformAttrs) }}
+		{{- $val := (convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute false false "src" $.TransformAttrs) }}
 		{{ $.TargetVar }} = &{{ index $.TargetValueTypeNames $i }}{ {{ (index $.TargetFieldNames $i) }}: {{ $val }} }
 {{- end }}
-}`
+}
+`
 
 	transformGoUnionFromProtoTmpl = `switch val := {{ .SourceVar }}.(type) {
 {{- range $i, $ref := .SourceValueTypeRefs }}
 case {{ . }}:
-	{{- $field := (print "val." (index $.SourceFieldNames $i)) }} 
-	{{ $.TargetVar }} = {{ convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute $field $.TransformAttrs }}
+	{{- $field := (print "val." (index $.SourceFieldNames $i)) }}
+	{{ $.TargetVar }} = {{ convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute false false $field $.TransformAttrs }}
 {{- end }}
-}`
+}
+`
 )
