@@ -226,9 +226,11 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		if len(secs) == 0 {
 			continue
 		}
-		h := codegen.Header("User types", codegen.Goify(filepath.Base(p), false), nil)
+		fullRelPath := filepath.Join(codegen.Gendir, p)
+		dir, _ := filepath.Split(fullRelPath)
+		h := codegen.Header("User types", codegen.Goify(filepath.Base(dir), false), nil)
 		sections := append([]*codegen.SectionTemplate{h}, secs...)
-		files = append(files, &codegen.File{Path: filepath.Join(codegen.Gendir, p), SectionTemplates: sections})
+		files = append(files, &codegen.File{Path: fullRelPath, SectionTemplates: sections})
 	}
 
 	return files
@@ -388,7 +390,14 @@ func (e {{ .Ref }}) Error() string {
 }
 
 // ErrorName returns {{ printf "%q" .Name }}.
+//
+// Deprecated: Use GoaErrorName - https://github.com/goadesign/goa/issues/3105
 func (e {{ .Ref }}) ErrorName() string {
+	return e.GoaErrorName()
+}
+
+// GoaErrorName returns {{ printf "%q" .Name }}.
+func (e {{ .Ref }}) GoaErrorName() string {
 	return {{ errorName . }}
 }
 `
@@ -399,20 +408,7 @@ const unionValueMethodT = `func ({{ .TypeRef }}) {{ .Name }}() {}
 // input: map[string]{"Type": TypeData, "Error": ErrorData}
 const errorInitT = `{{ printf "%s builds a %s from an error." .Name .TypeName |  comment }}
 func {{ .Name }}(err error) {{ .TypeRef }} {
-	return &{{ .TypeName }}{
-		Name: {{ printf "%q" .ErrName }},
-		ID: goa.NewErrorID(),
-		Message: err.Error(),
-	{{- if .Temporary }}
-		Temporary: true,
-	{{- end }}
-	{{- if .Timeout }}
-		Timeout: true,
-	{{- end }}
-	{{- if .Fault }}
-		Fault: true,
-	{{- end }}
-	}
+	return goa.NewServiceError(err, {{ printf "%q" .ErrName }}, {{ printf "%v" .Timeout }}, {{ printf "%v" .Temporary}}, {{ printf "%v" .Fault}})
 }
 `
 

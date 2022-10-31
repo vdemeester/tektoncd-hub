@@ -98,9 +98,9 @@ func clientEncodeDecodeFile(genpkg string, svc *expr.HTTPServiceExpr) *codegen.F
 	imports := []*codegen.ImportSpec{
 		{Path: "bytes"},
 		{Path: "context"},
+		{Path: "encoding/json"},
 		{Path: "fmt"},
 		{Path: "io"},
-		{Path: "io/ioutil"},
 		{Path: "mime/multipart"},
 		{Path: "net/http"},
 		{Path: "net/url"},
@@ -439,10 +439,10 @@ func {{ .RequestEncoder }}(encoder func(*http.Request) goahttp.Encoder) func(*ht
 				req.Header.Add({{ printf "%q" .Name }}, valStr)
 				{{- end }}
 			}
+			{{- else if (and (isAlias .FieldType) (eq (underlyingType .FieldType).Name "string")) }}
+			req.Header.Set({{ printf "%q" .Name }}, string(head))
 			{{- else if eq .Type.Name "string" }}
 			req.Header.Set({{ printf "%q" .Name }}, head)
-			{{- else if (and (isAlias .Type) (eq (underlyingType .Type).Name "string")) }}
-			req.Header.Set({{ printf "%q" .Name }}, string(head))
 			{{- else }}
 			{{ template "type_conversion" (typeConversionData .Type .FieldType "headStr" "head") }}
 			req.Header.Set({{ printf "%q" .Name }}, headStr)
@@ -646,13 +646,13 @@ const responseDecoderT = `{{ printf "%s returns a decoder for responses returned
 func {{ .ResponseDecoder }}(decoder func(*http.Response) goahttp.Decoder, restoreBody bool) func(*http.Response) (interface{}, error) {
 	return func(resp *http.Response) (interface{}, error) {
 		if restoreBody {
-			b, err := ioutil.ReadAll(resp.Body)
+			b, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return nil, err
 			}
-			resp.Body = ioutil.NopCloser(bytes.NewBuffer(b))
+			resp.Body = io.NopCloser(bytes.NewBuffer(b))
 			defer func() {
-				resp.Body = ioutil.NopCloser(bytes.NewBuffer(b))
+				resp.Body = io.NopCloser(bytes.NewBuffer(b))
 			}()
 		}
 		{{- if not .Method.SkipResponseBodyEncodeDecode }} else {
@@ -723,7 +723,7 @@ func {{ .ResponseDecoder }}(decoder func(*http.Response) goahttp.Decoder, restor
 				{{- end }}
 			{{- end }}
 		default:
-			body, _ := ioutil.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			return nil, goahttp.ErrInvalidResponse({{ printf "%q" $.ServiceName }}, {{ printf "%q" $.Method.Name }}, resp.StatusCode, string(body))
 		}
 		{{- else }}
@@ -740,7 +740,7 @@ func {{ .ResponseDecoder }}(decoder func(*http.Response) goahttp.Decoder, restor
 		{{- end }}
 	{{- end }}
 		default:
-			body, _ := ioutil.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			return nil, goahttp.ErrInvalidResponse({{ printf "%q" .ServiceName }}, {{ printf "%q" .Method.Name }}, resp.StatusCode, string(body))
 		}
 	}
@@ -949,7 +949,7 @@ func {{ .InitName }}(encoderFn {{ .FuncName }}) func(r *http.Request) goahttp.En
 			if err := encoderFn(mw, p); err != nil {
 				return err
 			}
-			r.Body = ioutil.NopCloser(body)
+			r.Body = io.NopCloser(body)
 			r.Header.Set("Content-Type", mw.FormDataContentType())
 			return mw.Close()
 		})
