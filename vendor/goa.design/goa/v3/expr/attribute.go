@@ -29,8 +29,6 @@ type (
 		Meta MetaExpr
 		// Optional member default value
 		DefaultValue interface{}
-		// ZeroValue sets the zero value for the attribute type
-		ZeroValue interface{}
 		// UserExample set in DSL or computed in Finalize
 		UserExamples []*ExampleExpr
 		// finalized is true if the attribute has been finalized - only
@@ -200,6 +198,9 @@ func (a *AttributeExpr) Validate(ctx string, parent eval.Expression) *eval.Valid
 		ctx += " - "
 	}
 	verr.Merge(a.validateEnumDefault(ctx, parent))
+	if v := a.Validation; v != nil {
+		verr.Merge(v.Validate(ctx, parent))
+	}
 	if o := AsObject(a.Type); o != nil {
 		for _, n := range a.AllRequired() {
 			if a.Find(n) == nil {
@@ -249,10 +250,15 @@ func (a *AttributeExpr) Validate(ctx string, parent eval.Expression) *eval.Valid
 // Finalize merges base and reference type attributes and finalizes the Type
 // attribute.
 func (a *AttributeExpr) Finalize() {
+	if a.finalized {
+		return // Avoid infinite recursion.
+	}
+	a.finalized = true
 	if ut, ok := a.Type.(UserType); ok {
 		ut.Finalize()
 	}
-	if IsObject(a.Type) {
+	switch {
+	case IsObject(a.Type):
 		for _, ref := range a.References {
 			ru, ok := ref.(UserType)
 			if !ok {
@@ -267,14 +273,39 @@ func (a *AttributeExpr) Finalize() {
 			}
 			a.Merge(ru.Attribute())
 		}
-		if a.finalized {
-			// Avoid infinite recursion.
-			return
+		var pkgPath string
+		if ut, ok := a.Type.(UserType); ok {
+			if meta, ok := ut.Attribute().Meta["struct:pkg:path"]; ok {
+				pkgPath = meta[0]
+			}
 		}
-		a.finalized = true
 		for _, nat := range *AsObject(a.Type) {
+			if pkgPath != "" {
+				if u := AsUnion(nat.Attribute.Type); u != nil {
+					for _, nat := range u.Values {
+						// Union types are generated using a private interface
+						// to ensure that only types that are part of the enum
+						// can be assigned to the attribute. This means that the
+						// union values must be declared in the same package as
+						// the parent attribute.
+						if ut, ok := nat.Attribute.Type.(UserType); ok {
+							ut.Attribute().Meta["struct:pkg:path"] = []string{pkgPath}
+						}
+					}
+				}
+			}
 			nat.Attribute.Finalize()
 		}
+	case IsUnion(a.Type):
+		for _, nat := range AsUnion(a.Type).Values {
+			nat.Attribute.Finalize()
+		}
+	case IsArray(a.Type):
+		AsArray(a.Type).ElemType.Finalize()
+	case IsMap(a.Type):
+		m := AsMap(a.Type)
+		m.ElemType.Finalize()
+		m.KeyType.Finalize()
 	}
 }
 
@@ -369,12 +400,11 @@ func (a *AttributeExpr) IsRequiredNoDefault(attName string) bool {
 // between request types where attributes with default values should not be
 // generated using a pointer value and response types where they should.
 //
-//    DefaultValue UseDefault Pointer (assuming all other conditions are true)
-//    Yes          True       False
-//    Yes          False      True
-//    No           True       True
-//    No           False      True
-//
+//	DefaultValue UseDefault Pointer (assuming all other conditions are true)
+//	Yes          True       False
+//	Yes          False      True
+//	No           True       True
+//	No           False      True
 func (a *AttributeExpr) IsPrimitivePointer(attName string, useDefault bool) bool {
 	o := AsObject(a.Type)
 	if o == nil {
@@ -564,20 +594,23 @@ func (a *AttributeExpr) debug(prefix string, seen map[*AttributeExpr]int, indent
 	} else {
 		fmt.Printf("%s: %s <%T>\n", prefix, n, a.Type)
 	}
-	if o := AsObject(a.Type); o != nil {
-		for _, nat := range *o {
+	ut, isUT := a.Type.(UserType)
+	switch {
+	case isUT:
+		ut.Attribute().debug("att", seen, indent+1)
+		tabs = strings.Repeat(tab, indent+1)
+	case IsObject(a.Type):
+		for _, nat := range *AsObject(a.Type) {
 			nat.Attribute.debug("- "+nat.Name, seen, indent+1)
 		}
-	}
-	if a := AsArray(a.Type); a != nil {
-		a.ElemType.debug("elem", seen, indent+1)
-	}
-	if m := AsMap(a.Type); m != nil {
+	case IsArray(a.Type):
+		AsArray(a.Type).ElemType.debug("elem", seen, indent+1)
+	case IsMap(a.Type):
+		m := AsMap(a.Type)
 		m.KeyType.debug("key", seen, indent+1)
 		m.ElemType.debug("elem", seen, indent+1)
-	}
-	if u := AsUnion(a.Type); u != nil {
-		for _, nat := range u.Values {
+	case IsUnion(a.Type):
+		for _, nat := range AsUnion(a.Type).Values {
 			nat.Attribute.debug("* "+nat.Name, seen, indent+1)
 		}
 	}
@@ -610,11 +643,6 @@ func (a *AttributeExpr) debug(prefix string, seen map[*AttributeExpr]int, indent
 	}
 	if v := a.Validation; v != nil {
 		v.Debug("", tabs+tab, tab)
-	}
-	if t, ok := a.Type.(UserType); ok {
-		if v := t.Attribute().Validation; v != nil {
-			v.Debug("user type ", tabs+tab, tab)
-		}
 	}
 	if len(a.Bases) > 0 {
 		fmt.Printf("%s%sbases\n", tabs, tab)
@@ -711,6 +739,35 @@ func (a *AttributeExpr) shouldInherit(parent *AttributeExpr) bool {
 // EvalName returns the name used by the DSL evaluation.
 func (a *ExampleExpr) EvalName() string {
 	return `example "` + a.Summary + `"`
+}
+
+// Validate validates the validation expression.
+func (v *ValidationExpr) Validate(ctx string, parent eval.Expression) *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
+	hasMin, hasMax := v.Minimum != nil, v.Maximum != nil
+	hasExclusiveMin, hasExclusiveMax := v.ExclusiveMinimum != nil, v.ExclusiveMaximum != nil
+	if hasMin && hasExclusiveMin {
+		verr.Add(parent, "%sboth minimum and exclusive minimum are defined", ctx)
+	}
+	if hasMax && hasExclusiveMax {
+		verr.Add(parent, "%sboth maximum and exclusive maximum are defined", ctx)
+	}
+	if hasMin && hasMax && *v.Minimum > *v.Maximum {
+		verr.Add(parent, "%sminimum is greater than maximum", ctx)
+	}
+	if hasMin && hasExclusiveMax && *v.Minimum >= *v.ExclusiveMaximum {
+		verr.Add(parent, "%sminimum is greater than or equal to exclusive maximum", ctx)
+	}
+	if hasExclusiveMin && hasExclusiveMax && *v.ExclusiveMinimum > *v.ExclusiveMaximum {
+		verr.Add(parent, "%sexclusive minimum is greater than exclusive maximum", ctx)
+	}
+	if hasExclusiveMin && hasMax && *v.ExclusiveMinimum >= *v.Maximum {
+		verr.Add(parent, "%sexclusive minimum is greater than or equal to maximum", ctx)
+	}
+	if v.MinLength != nil && v.MaxLength != nil && *v.MinLength > *v.MaxLength {
+		verr.Add(parent, "%smin length is greater than max length", ctx)
+	}
+	return verr
 }
 
 // Merge merges other into v.
