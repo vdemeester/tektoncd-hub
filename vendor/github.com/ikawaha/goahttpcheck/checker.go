@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"testing"
 	"time"
 
 	"github.com/ikawaha/httpcheck"
@@ -16,7 +15,7 @@ type (
 	decoder      = func(*http.Request) goahttp.Decoder
 	encoder      = func(context.Context, http.ResponseWriter) goahttp.Encoder
 	errorHandler = func(context.Context, http.ResponseWriter, error)
-	formatter    = func(error) goahttp.Statuser
+	formatter    = func(context.Context, error) goahttp.Statuser
 	middleware   = func(http.Handler) http.Handler
 
 	// HandlerBuilder represents the goa http handler builder.
@@ -55,9 +54,9 @@ func CheckRedirect(policy func(req *http.Request, via []*http.Request) error) Op
 
 // NoRedirect is the alias of the following:
 //
-//  CheckRedirect(func(req *http.Request, via []*http.Request) error {
-//      return http.ErrUseLastResponse
-//  })
+//	CheckRedirect(func(req *http.Request, via []*http.Request) error {
+//	    return http.ErrUseLastResponse
+//	})
 //
 // Client returns ErrUseLastResponse, the next request is not sent and the most recent
 // response is returned with its body unclosed.
@@ -133,9 +132,15 @@ func (c *APIChecker) Use(middleware func(http.Handler) http.Handler) {
 	c.Middleware = append(c.Middleware, middleware)
 }
 
+// TestingT is an interface wrapper around *testing.T.
+type TestingT interface {
+	Errorf(format string, args ...any)
+	FailNow()
+}
+
 // Test returns a http checker that tests the endpoint.
 // see. https://github.com/ikawaha/httpcheck/
-func (c APIChecker) Test(t *testing.T, method, path string) *httpcheck.Tester {
+func (c APIChecker) Test(t TestingT, method, path string) *httpcheck.Tester {
 	var handler http.Handler = c.Mux
 	for _, v := range c.Middleware {
 		handler = v(handler)
