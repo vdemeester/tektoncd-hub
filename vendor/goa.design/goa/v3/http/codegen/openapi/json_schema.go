@@ -337,7 +337,8 @@ func TypeSchemaWithPrefix(api *expr.APIExpr, t expr.DataType, prefix string) *Sc
 		}
 	case *expr.Map:
 		s.Type = Object
-		if actual.KeyType.Type == expr.String {
+		if actual.KeyType.Type == expr.String && actual.ElemType.Type != expr.Any {
+			// Use free-form objects when elements are of type "Any"
 			additionalProperties := NewSchema()
 			s.AdditionalProperties = buildAttributeSchema(api, additionalProperties, actual.ElemType)
 		} else {
@@ -464,7 +465,7 @@ func buildAttributeSchema(api *expr.APIExpr, s *Schema, at *expr.AttributeExpr) 
 	}
 	s.DefaultValue = ToStringMap(at.DefaultValue)
 	s.Description = at.Description
-	s.Example = at.Example(api.Random())
+	s.Example = at.Example(api.ExampleGenerator)
 	s.Extensions = ExtensionsFromExpr(at.Meta)
 	initAttributeValidation(s, at)
 
