@@ -127,7 +127,7 @@ func initWebSocketData(ed *EndpointData, e *expr.HTTPEndpointExpr, sd *ServiceDa
 							if ut, ok := body.(expr.UserType); ok {
 								if val := ut.Attribute().Validation; val != nil {
 									httpctx := httpContext("", sd.Scope, true, true)
-									svcode = codegen.RecursiveValidationCode(ut.Attribute(), httpctx, true, expr.IsAlias(ut), "body")
+									svcode = codegen.ValidationCode(ut.Attribute(), ut, httpctx, true, expr.IsAlias(ut), "body")
 								}
 							}
 						}
@@ -139,7 +139,7 @@ func initWebSocketData(ed *EndpointData, e *expr.HTTPEndpointExpr, sd *ServiceDa
 								TypeRef:  sd.Scope.GoTypeRef(e.StreamingBody),
 								Type:     e.StreamingBody.Type,
 								Required: true,
-								Example:  e.Body.Example(expr.Root.API.Random()),
+								Example:  e.Body.Example(expr.Root.API.ExampleGenerator),
 								Validate: svcode,
 							},
 						}}
