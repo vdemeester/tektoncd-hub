@@ -332,6 +332,17 @@ func (e *GRPCEndpointExpr) Finalize() {
 				nat.Attribute.Meta.Merge(patt.Meta)
 			}
 		}
+		if ut, ok := e.MethodExpr.Payload.Type.(UserType); ok {
+			// propagate the user set protobuf struct name from the user type to
+			// the request message.
+			if proto, ok := ut.Attribute().Meta.Last("struct:name:proto"); ok {
+				if e.Request.Meta == nil {
+					e.Request.Meta = ut.Attribute().Meta
+				} else {
+					e.Request.Meta["struct:name:proto"] = []string{proto}
+				}
+			}
+		}
 	} else {
 		// method payload is not an object type.
 		if e.MethodExpr.StreamingPayload.Type != Empty {
