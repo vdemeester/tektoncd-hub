@@ -122,16 +122,15 @@ func buildPaths(h *expr.HTTPExpr, bodies map[string]map[string]*EndpointBodies, 
 		if !openapi.MustGenerate(svc.Meta) || !openapi.MustGenerate(svc.ServiceExpr.Meta) {
 			continue
 		}
-
 		exts := openapi.ExtensionsFromExpr(svc.Meta)
 		sbod := bodies[svc.Name()]
 
 		// endpoints
 		for _, e := range svc.HTTPEndpoints {
+
 			if !openapi.MustGenerate(e.Meta) || !openapi.MustGenerate(e.MethodExpr.Meta) {
 				continue
 			}
-
 			for _, r := range e.Routes {
 				for _, key := range r.FullPaths() {
 					// Remove any wildcards that is defined in path as a workaround to
@@ -340,6 +339,8 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		}
 	}
 
+	// An endpoint may be marked as deprecated. if the openapi:deprecated tag is present, we populate it to true
+	_, deprecated := e.Meta.Last("openapi:deprecated")
 	return &Operation{
 		Tags:         tagNames,
 		Summary:      summary,
@@ -349,13 +350,13 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		RequestBody:  requestBody,
 		Responses:    responses,
 		Security:     buildSecurityRequirements(e.Requirements),
-		Deprecated:   false,
+		Deprecated:   deprecated,
 		ExternalDocs: openapi.DocsFromExpr(m.Docs, m.Meta),
 		Extensions:   openapi.ExtensionsFromExpr(m.Meta),
 	}
 }
 
-// buildOperation builds the OpenAPI Operation object for the given file server.
+// buildFileServerOperation builds the OpenAPI Operation object for the given file server.
 func buildFileServerOperation(key string, fs *expr.HTTPFileServerExpr, api *expr.APIExpr) *Operation {
 	wildcards := expr.ExtractHTTPWildcards(key)
 	svc := fs.Service
@@ -549,7 +550,7 @@ func buildSecurityRequirements(reqs []*expr.SecurityExpr) []map[string][]string 
 	for i, req := range reqs {
 		sr := make(map[string][]string, len(req.Schemes))
 		for _, sch := range req.Schemes {
-			scopes := []string{}
+			scopes := make([]string, 0)
 			switch sch.Kind {
 			case expr.OAuth2Kind, expr.JWTKind:
 				if len(req.Scopes) > 0 {
