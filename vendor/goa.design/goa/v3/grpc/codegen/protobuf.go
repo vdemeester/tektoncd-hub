@@ -199,6 +199,9 @@ func protoBufFullMessageName(att *expr.AttributeExpr, pkg string, s *codegen.Nam
 	switch actual := att.Type.(type) {
 	case expr.UserType, *expr.Union:
 		n := s.HashedUnique(actual, protoBufify(actual.Name(), true, true), "")
+		if name := att.Meta["struct:name:proto"]; len(name) > 0 {
+			n = name[0]
+		}
 		if pkg == "" {
 			return n
 		}
@@ -210,7 +213,7 @@ func protoBufFullMessageName(att *expr.AttributeExpr, pkg string, s *codegen.Nam
 	}
 }
 
-// protoBufGoFullTypeName returns the protocol buffer type name for the given
+// protoBufGoTypeName returns the protocol buffer type name for the given
 // attribute generated after compiling the proto file (in *.pb.go).
 func protoBufGoTypeName(att *expr.AttributeExpr, s *codegen.NameScope) string {
 	return protoBufGoFullTypeName(att, "", s)

@@ -2,10 +2,10 @@ package eval
 
 import (
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"unicode"
 )
 
 // RunDSL iterates through the root expressions and calls WalkSets on each to
@@ -116,14 +116,19 @@ func ReportError(fm string, vals ...any) {
 // IncompatibleDSL should be called by DSL functions when they are invoked in an
 // incorrect context (e.g. "Params" in "Service").
 func IncompatibleDSL() {
-	elems := strings.Split(caller(), ".")
-	ReportError("invalid use of %s", elems[len(elems)-1])
+	ReportError("invalid use of %s", caller())
 }
 
 // InvalidArgError records an invalid argument error. It is used by DSL
 // functions that take dynamic arguments.
 func InvalidArgError(expected string, actual any) {
 	ReportError("cannot use %#v (type %s) as type %s", actual, reflect.TypeOf(actual), expected)
+}
+
+// TooManyArgError records a too many arguments error. It is used by DSL
+// functions that take dynamic arguments.
+func TooManyArgError() {
+	ReportError("too many arguments given to %s", caller())
 }
 
 // ValidationErrors records the errors encountered when running Validate.
@@ -235,13 +240,20 @@ func finalizeSet(set ExpressionSet) {
 
 // caller returns the name of calling function.
 func caller() string {
-	pc, file, _, ok := runtime.Caller(2)
-	if ok && filepath.Base(file) == "current.go" {
-		pc, _, _, ok = runtime.Caller(3)
+	for skip := 2; skip <= 4; skip++ {
+		pc, _, _, ok := runtime.Caller(skip)
+		if !ok {
+			break
+		}
+		name := runtime.FuncForPC(pc).Name()
+		elems := strings.Split(name, ".")
+		caller := elems[len(elems)-1]
+		for _, first := range caller {
+			if unicode.IsUpper(first) {
+				return caller
+			}
+			break
+		}
 	}
-	if !ok {
-		return "<unknown>"
-	}
-
-	return runtime.FuncForPC(pc).Name()
+	return "<unknown>"
 }
