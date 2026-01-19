@@ -106,7 +106,20 @@ func (s *NameScope) GoTypeDef(att *expr.AttributeExpr, ptr, useDefault bool) str
 	return s.goTypeDef(att, ptr, useDefault, pkg)
 }
 
-func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg string) string {
+// GoTypeDefWithTargetPkg returns the Go type definition string, qualifying any
+// user types inside inline structs with the provided target package. This helps
+// when generating JSON-RPC client types that embed inline structs referencing
+// user types defined in a separate package (e.g., gen/types).
+func (s *NameScope) GoTypeDefWithTargetPkg(att *expr.AttributeExpr, ptr, useDefault bool, targetPkg string) string {
+	return s.goTypeDefWithPkgOverride(att, ptr, useDefault, "", targetPkg)
+}
+
+// goTypeDefWithPkgOverride generates the Go type definition string for the attribute.
+// When targetPkg is not empty, user types referenced inside inline structs are
+// qualified against targetPkg unless they are defined in a different package,
+// in which case their own package is used. When targetPkg is empty, the
+// package qualification falls back to pkg and the user type location.
+func (s *NameScope) goTypeDefWithPkgOverride(att *expr.AttributeExpr, ptr, useDefault bool, pkg, targetPkg string) string {
 	switch actual := att.Type.(type) {
 	case expr.Primitive:
 		if t, _ := GetMetaType(att); t != "" {
@@ -114,23 +127,29 @@ func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg
 		}
 		return GoNativeTypeName(actual)
 	case *expr.Array:
-		d := s.goTypeDef(actual.ElemType, ptr, useDefault, pkg)
+		d := s.goTypeDefWithPkgOverride(actual.ElemType, ptr, useDefault, pkg, targetPkg)
 		if expr.IsObject(actual.ElemType.Type) {
 			d = "*" + d
 		}
 		return "[]" + d
 	case *expr.Map:
-		keyDef := s.goTypeDef(actual.KeyType, ptr, useDefault, pkg)
+		keyDef := s.goTypeDefWithPkgOverride(actual.KeyType, ptr, useDefault, pkg, targetPkg)
 		if expr.IsObject(actual.KeyType.Type) {
 			keyDef = "*" + keyDef
 		}
-		elemDef := s.goTypeDef(actual.ElemType, ptr, useDefault, pkg)
+		elemDef := s.goTypeDefWithPkgOverride(actual.ElemType, ptr, useDefault, pkg, targetPkg)
 		if expr.IsObject(actual.ElemType.Type) {
 			elemDef = "*" + elemDef
 		}
 		return fmt.Sprintf("map[%s]%s", keyDef, elemDef)
 	case *expr.Union:
-		return fmt.Sprintf("interface{\n\t%s()\n}", UnionValTypeName(actual.TypeName))
+		// Unions are generated as named sum-type structs. Refer to the named type
+		// here; the concrete definition is emitted separately by the service
+		// code generator.
+		if targetPkg != "" {
+			return s.GoFullTypeName(att, targetPkg)
+		}
+		return s.GoFullTypeName(att, "")
 	case *expr.Object:
 		ss := []string{"struct {"}
 		for _, nat := range *actual {
@@ -145,7 +164,7 @@ func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg
 			)
 			{
 				fn = GoifyAtt(at, name, true)
-				tdef = s.goTypeDef(at, ptr, useDefault, pkg)
+				tdef = s.goTypeDefWithPkgOverride(at, ptr, useDefault, pkg, targetPkg)
 				if expr.IsObject(at.Type) ||
 					att.IsPrimitivePointer(name, useDefault) ||
 					(ptr && expr.IsPrimitive(at.Type) && at.Type.Kind() != expr.AnyKind && at.Type.Kind() != expr.BytesKind) {
@@ -154,7 +173,7 @@ func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg
 				if at.Description != "" {
 					desc = Comment(at.Description) + "\n\t"
 				}
-				tags = AttributeTags(att, at)
+				tags = AttributeTagsWithName(att, name, at)
 			}
 			ss = append(ss, fmt.Sprintf("\t%s%s %s%s", desc, fn, tdef, tags))
 		}
@@ -165,13 +184,27 @@ func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg
 			return "struct {}"
 		}
 		var prefix string
-		if loc := UserTypeLocation(actual); loc != nil && loc.PackageName() != pkg {
-			prefix = loc.PackageName() + "."
+		if loc := UserTypeLocation(actual); loc != nil {
+			if targetPkg != "" {
+				if loc.PackageName() != targetPkg {
+					prefix = loc.PackageName() + "."
+				} else {
+					prefix = targetPkg + "."
+				}
+			} else if loc.PackageName() != pkg {
+				prefix = loc.PackageName() + "."
+			}
+		} else if targetPkg != "" {
+			prefix = targetPkg + "."
 		}
 		return prefix + s.GoTypeName(att)
 	default:
 		panic(fmt.Sprintf("unknown data type %T", actual)) // bug
 	}
+}
+
+func (s *NameScope) goTypeDef(att *expr.AttributeExpr, ptr, useDefault bool, pkg string) string {
+	return s.goTypeDefWithPkgOverride(att, ptr, useDefault, pkg, "")
 }
 
 // GoVar returns the Go code that returns the address of a variable of the Go type
