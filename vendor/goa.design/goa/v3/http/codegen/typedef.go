@@ -102,8 +102,25 @@ func attributeTags(parent, att *expr.AttributeExpr, t string, optional bool) str
 		return tags
 	}
 	var o string
-	if optional {
+	// Always use omitempty for JSON-RPC ID attributes, even when required
+	// since it is part of a different top-level field in the transport
+	if optional || isJSONRPCID(att) {
 		o = ",omitempty"
 	}
-	return fmt.Sprintf(" `form:\"%s%s\" json:\"%s%s\" xml:\"%s%s\"`", t, o, t, o, t, o)
+	jsonName := t
+	if att != nil && att.Meta != nil {
+		if v := att.Meta["struct:tag:json:name"]; len(v) > 0 && v[0] != "" {
+			jsonName = strings.Join(v, ",")
+		}
+	}
+	return fmt.Sprintf(" `form:\"%s%s\" json:\"%s%s\" xml:\"%s%s\"`", t, o, jsonName, o, t, o)
+}
+
+// isJSONRPCID checks if the attribute is marked as a JSON-RPC ID attribute
+func isJSONRPCID(att *expr.AttributeExpr) bool {
+	if att.Meta == nil {
+		return false
+	}
+	_, ok := att.Meta["jsonrpc:id"]
+	return ok
 }

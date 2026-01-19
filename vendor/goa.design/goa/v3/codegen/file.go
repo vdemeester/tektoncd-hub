@@ -9,12 +9,11 @@ import (
 	"go/scanner"
 	"go/token"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
-	"strings"
 	"text/template"
 
-	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/imports"
 )
 
@@ -86,28 +85,26 @@ func (f *File) Render(dir string) (string, error) {
 		return "", err
 	}
 
-	file, err := os.OpenFile(
-		path,
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
-		0600,
-	)
-	if err != nil {
-		return "", err
-	}
+	// Render all sections to a buffer instead of directly to file
+	var buf bytes.Buffer
 	for _, s := range f.SectionTemplates {
-		if err := s.Write(file); err != nil {
+		if err := s.Write(&buf); err != nil {
 			return "", err
 		}
-	}
-	if err := file.Close(); err != nil {
-		return "", err
 	}
 
-	// Format Go source files
+	// For Go files, process everything in memory
+	content := buf.Bytes()
 	if filepath.Ext(path) == ".go" {
-		if err := finalizeGoSource(path); err != nil {
+		content, err = finalizeGoSource(path, content)
+		if err != nil {
 			return "", err
 		}
+	}
+
+	// Write the final content exactly once
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		return "", err
 	}
 
 	// Run finalizer if any
@@ -123,64 +120,43 @@ func (f *File) Render(dir string) (string, error) {
 // Write writes the section to the given writer.
 func (s *SectionTemplate) Write(w io.Writer) error {
 	funcs := TemplateFuncs()
-	for k, v := range s.FuncMap {
-		funcs[k] = v
-	}
+	maps.Copy(funcs, s.FuncMap)
 	tmpl := template.Must(template.New(s.Name).Funcs(funcs).Parse(s.Source))
 	return tmpl.Execute(w, s.Data)
 }
 
-// finalizeGoSource removes unneeded imports from the given Go source file and
-// runs go fmt on it.
-func finalizeGoSource(path string) error {
-	// Make sure file parses and print content if it does not.
+// finalizeGoSource processes Go source entirely in memory without file I/O
+func finalizeGoSource(path string, content []byte) ([]byte, error) {
+	// Parse the content
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	file, err := parser.ParseFile(fset, path, content, parser.ParseComments)
 	if err != nil {
-		content, _ := os.ReadFile(path)
 		var buf bytes.Buffer
 		scanner.PrintError(&buf, err)
-		return fmt.Errorf("%s\n========\nContent:\n%s", buf.String(), content)
+		return nil, fmt.Errorf("%s\n========\nContent:\n%s", buf.String(), content)
 	}
 
-	// Clean unused imports
-	imps := astutil.Imports(fset, file)
-	for _, group := range imps {
-		for _, imp := range group {
-			path := strings.Trim(imp.Path.Value, `"`)
-			if !astutil.UsesImport(file, path) {
-				if imp.Name != nil {
-					astutil.DeleteNamedImport(fset, file, imp.Name.Name, path)
-				} else {
-					astutil.DeleteImport(fset, file, path)
-				}
-			}
-		}
-	}
+	// Clean unused imports using optimized single-pass detection
+	impMap := buildImportMap(file)
+	detectUsedImports(file, impMap)
+	removeUnusedImports(fset, file, impMap)
 	ast.SortImports(fset, file)
-	w, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
-	if err != nil {
-		return err
-	}
-	if err := format.Node(w, fset, file); err != nil {
-		return err
-	}
-	if err := w.Close(); err != nil {
-		return err
+
+	// Format the AST back to bytes
+	var formatted bytes.Buffer
+	if err := format.Node(&formatted, fset, file); err != nil {
+		return nil, err
 	}
 
-	// Format code using goimport standard
-	bs, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
+	// Apply goimports formatting
 	opt := imports.Options{
 		Comments:   true,
 		FormatOnly: true,
 	}
-	bs, err = imports.Process(path, bs, &opt)
+	result, err := imports.Process(path, formatted.Bytes(), &opt)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(path, bs, os.ModePerm)
+
+	return result, nil
 }
